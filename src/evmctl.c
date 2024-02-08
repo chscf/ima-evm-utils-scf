@@ -43,6 +43,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
+#include <asm/byteorder.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -2748,6 +2749,91 @@ static int cmd_ima_bootaggr(struct command *cmd)
 	return 0;
 }
 
+static int ima_sig_import_v2(const char *hashalgo, const char *keyfile, const char *rawsigfile, const char *file)
+{
+ unsigned char *rawsig;
+ int rawsigsz, len, ret = 0, memlock_len;
+ unsigned char sig[1024] = "\x03";
+ char name[20];
+ struct signature_v2_hdr *hdr = (struct signature_v2_hdr *)(sig + 1);
+ EVP_PKEY *key;
+
+ rawsig = file2bin(rawsigfile, NULL, &rawsigsz);
+ if (!rawsig) {
+  log_err("Unable to read file %s\n", rawsigfile);
+  return 1;
+ }
+
+ key = read_pub_pkey(keyfile, imaevm_params.x509);
+ if (!key) {
+  free(rawsig);
+  return 1;
+ }
+
+ hdr->version = 2;
+ hdr->hash_algo = imaevm_get_hash_algo(hashalgo);
+
+ calc_keyid_v2(&hdr->keyid, name, key);
+ memcpy(hdr->sig, rawsig, rawsigsz);
+
+ len = rawsigsz;
+ hdr->sig_size = __cpu_to_be16(len);
+ len += sizeof(*hdr);
+ log_info("evm/ima signature: %d bytes\n", len);
+ if (sigdump || imaevm_params.verbose >= LOG_INFO)
+  imaevm_hexdump(sig + 1, len);
+
+ /* Add ima header */
+ len++;
+#if 0
+ if (memlock) {
+  memlock_len = add_memlock_info(sig + len);
+  len += memlock_len;
+ }
+#endif
+
+ if (sigfile)
+  bin2file(file, "sig", sig, len);
+
+ if (xattr) {
+  ret = setxattr(file, "security.ima", sig, len, 0); 
+  if (ret < 0) {
+   log_err("setxattr failed: %s\n", file);
+   goto out;
+  }
+ }
+
+out:
+ EVP_PKEY_free(key);
+ free(rawsig);
+ return ret;
+}
+
+static int cmd_ima_sig_import(struct command *cmd)
+{
+ char *rawsigfile, *file, *key;
+
+ rawsigfile = g_argv[optind++];
+ file = g_argv[optind++];
+
+ if (!file || !rawsigfile) {
+  log_err("Parameters missing\n");
+  print_usage(cmd);
+  return -1;
+ }
+
+ key = imaevm_params.keyfile ? : imaevm_params.x509 ?
+   "/etc/keys/x509_evm.der" :
+   "/etc/keys/pubkey_evm.pem";
+
+ if (imaevm_params.x509)
+  return ima_sig_import_v2(imaevm_params.hash_algo, key, rawsigfile, file);
+ else {
+  log_err("Signature version 1 import not supported.\n");
+  return 1;
+ }
+}
+
 static void print_usage(struct command *cmd)
 {
 	printf("usage: %s %s\n", cmd->name, cmd->arg ? cmd->arg : "");
@@ -2887,6 +2973,7 @@ struct command cmds[] = {
 #ifdef DEBUG
 	{"hmac", cmd_hmac_evm, 0, "[--imahash | --imasig ] file", "Sign file metadata with HMAC using symmetric key (for testing purpose).\n"},
 #endif
+	{"ima_sig_import", cmd_ima_sig_import, 0, "[--x509] [-a hashalgo] [-k pubkey] signature file", "Make IMA si    gnature from externally signed raw signature blob.\n"},
 	{0, 0, 0, NULL}
 };
 
