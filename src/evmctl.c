@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * ima-evm-utils - IMA/EVM support utilities
  *
@@ -10,30 +11,6 @@
  *                 <dmitry.kasatkin@intel.com>
  *                 <d.kasatkin@samsung.com>
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
- *
  * File: evmctl.c
  *	 IMA/EVM control program
  */
@@ -43,7 +20,6 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
-#include <asm/byteorder.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -68,6 +44,9 @@
 #include <openssl/rsa.h>
 #if CONFIG_IMA_EVM_ENGINE
 #include <openssl/engine.h>
+#endif
+#if CONFIG_IMA_EVM_PROVIDER
+#include <openssl/provider.h>
 #endif
 #include <openssl/x509v3.h>
 #include "hash_info.h"
@@ -137,15 +116,31 @@ static int verify_list_sig;
 static int recursive;
 static int msize;
 static dev_t fs_dev;
-static bool evm_immutable;
 static bool evm_portable;
 static bool veritysig;
 static bool hwtpm;
+static char *g_hash_algo = DEFAULT_HASH_ALGO;
+static char *g_keypass;
+
+enum signature_version {
+	SIGNATURE_V2 = 2,
+	SIGNATURE_V3,
+};
+
+static enum signature_version g_signature_version = SIGNATURE_V2;
 
 #define HMAC_FLAG_NO_UUID	0x0001
 #define HMAC_FLAG_CAPS_SET	0x0002
 
 static unsigned long hmac_flags;
+static uint32_t imaevm_keyid;
+static struct imaevm_ossl_access access_info;
+static long sigflags;
+
+static inline bool use_x509(long sigflags)
+{
+	return (sigflags & IMAEVM_SIGFLAG_SIGNATURE_V1) == 0;
+}
 
 typedef int (*find_cb_t)(const char *path);
 static int find(const char *path, int dts, find_cb_t func);
@@ -165,6 +160,12 @@ struct tpm_bank_info {
 	uint8_t digest[MAX_DIGEST_SIZE];
 	uint8_t pcr[NUM_PCRS][MAX_DIGEST_SIZE];
 };
+
+static const char * const default_algos[] = {
+	"sha1", "sha256", "sha384", "sha512"
+};
+
+#define ARRAY_SIZE(ARR) (sizeof(ARR) / sizeof((ARR)[0]))
 
 /* One --pcrs file per hash-algorithm/bank */
 #define MAX_PCRFILE 2
@@ -197,7 +198,7 @@ static int bin2file(const char *file, const char *ext, const unsigned char *data
 	return err;
 }
 
-static unsigned char *file2bin(const char *file, const char *ext, int *size)
+static unsigned char *file2bin(const char *file, const char *ext, size_t *size)
 {
 	FILE *fp;
 	size_t len;
@@ -238,7 +239,7 @@ static unsigned char *file2bin(const char *file, const char *ext, int *size)
 	}
 	fclose(fp);
 
-	*size = (int)len;
+	*size = len;
 	return data;
 }
 
@@ -341,7 +342,8 @@ err:
  * Returns 0 for EVP_ function failures. Return -1 for other failures.
  * Return hash algorithm size on success.
  */
-static int calc_evm_hash(const char *file, unsigned char *hash)
+static int calc_evm_hash(const char *file, const char *hash_algo,
+			 unsigned char *hash)
 {
         const EVP_MD *md;
 	struct stat st;
@@ -350,7 +352,7 @@ static int calc_evm_hash(const char *file, unsigned char *hash)
 	EVP_MD_CTX *pctx;
 	unsigned int mdlen;
 	char **xattrname;
-	char xattr_value[1024];
+	char xattr_value[MAX_SIGNATURE_SIZE];
 	char list[1024];
 	ssize_t list_size;
 	char uuid[16];
@@ -360,6 +362,7 @@ static int calc_evm_hash(const char *file, unsigned char *hash)
 	EVP_MD_CTX ctx;
 	pctx = &ctx;
 #endif
+	size_t len;
 
 	if (lstat(file, &st)) {
 		log_errno_reset(LOG_ERR, "Failed to stat: %s", file);
@@ -377,7 +380,7 @@ static int calc_evm_hash(const char *file, unsigned char *hash)
 	if (mode_str)
 		st.st_mode = strtoul(mode_str, NULL, 10);
 
-	if (!evm_immutable) {
+	if (!evm_portable) {
 		if (S_ISREG(st.st_mode) && !generation_str) {
 			int fd = open(file, 0);
 
@@ -409,10 +412,9 @@ static int calc_evm_hash(const char *file, unsigned char *hash)
 	}
 #endif
 
-	md = EVP_get_digestbyname(imaevm_params.hash_algo);
+	md = EVP_get_digestbyname(hash_algo);
 	if (!md) {
-		log_err("EVP_get_digestbyname(%s) failed\n",
-			imaevm_params.hash_algo);
+		log_err("EVP_get_digestbyname(%s) failed\n", hash_algo);
 		err = 0;
 		goto out;
 	}
@@ -427,19 +429,19 @@ static int calc_evm_hash(const char *file, unsigned char *hash)
 		int use_xattr_ima = 0;
 
 		if (!strcmp(*xattrname, XATTR_NAME_SELINUX) && selinux_str) {
-			err = strlen(selinux_str) + 1;
-			if (err > sizeof(xattr_value)) {
-				log_err("selinux[%u] value is too long to fit into xattr[%zu]\n",
-					err, sizeof(xattr_value));
+			len = strlen(selinux_str) + 1;
+			if (len > sizeof(xattr_value)) {
+				log_err("selinux[%zu] value is too long to fit into xattr[%zu]\n",
+					len, sizeof(xattr_value));
 				err = -1;
 				goto out;
 			}
 			strcpy(xattr_value, selinux_str);
 		} else if (!strcmp(*xattrname, XATTR_NAME_IMA) && ima_str) {
-			err = strlen(ima_str) / 2;
-			if (err > sizeof(xattr_value)) {
-				log_err("ima[%u] value is too long to fit into xattr[%zu]\n",
-					err, sizeof(xattr_value));
+			len = strlen(ima_str) / 2;
+			if (len > sizeof(xattr_value)) {
+				log_err("ima[%zu] value is too long to fit into xattr[%zu]\n",
+					len, sizeof(xattr_value));
 				err = -1;
 				goto out;
 			}
@@ -456,10 +458,10 @@ static int calc_evm_hash(const char *file, unsigned char *hash)
 		} else if (!strcmp(*xattrname, XATTR_NAME_CAPS) && (hmac_flags & HMAC_FLAG_CAPS_SET)) {
 			if (!caps_str)
 				continue;
-			err = strlen(caps_str);
-			if (err >= sizeof(xattr_value)) {
-				log_err("caps[%u] value is too long to fit into xattr[%zu]\n",
-					err + 1, sizeof(xattr_value));
+			len = strlen(caps_str);
+			if (len >= sizeof(xattr_value)) {
+				log_err("caps[%zu] value is too long to fit into xattr[%zu]\n",
+					len + 1, sizeof(xattr_value));
 				err = -1;
 				goto out;
 			}
@@ -488,14 +490,7 @@ static int calc_evm_hash(const char *file, unsigned char *hash)
 
 	memset(&hmac_misc, 0, sizeof(hmac_misc));
 
-	if (evm_immutable) {
-		struct h_misc_digsig *hmac = (struct h_misc_digsig *)&hmac_misc;
-
-		hmac_size = sizeof(*hmac);
-		hmac->uid = st.st_uid;
-		hmac->gid = st.st_gid;
-		hmac->mode = st.st_mode;
-	} else if (msize == 0) {
+	if (msize == 0) {
 		struct h_misc *hmac = (struct h_misc *)&hmac_misc;
 
 		hmac_size = sizeof(*hmac);
@@ -539,7 +534,7 @@ static int calc_evm_hash(const char *file, unsigned char *hash)
 		goto out;
 	}
 
-	if (!evm_immutable && !evm_portable &&
+	if (!evm_portable &&
 	    !(hmac_flags & HMAC_FLAG_NO_UUID)) {
 		err = get_uuid(&st, uuid);
 		if (err)
@@ -565,31 +560,50 @@ out:
 	return err;
 }
 
-static int sign_evm(const char *file, const char *key)
+static int sign_evm(const char *file, char *hash_algo, const char *key)
 {
-	unsigned char hash[MAX_DIGEST_SIZE];
 	unsigned char sig[MAX_SIGNATURE_SIZE];
-	int len, err;
+	unsigned char hash[MAX_DIGEST_SIZE];
+	enum evm_ima_xattr_type xattr_type;
+	unsigned char *psig;
+	size_t len;
+	int err;
 
-	len = calc_evm_hash(file, hash);
-	if (len <= 1)
-		return len;
+	err = calc_evm_hash(file, hash_algo, hash);
+	if (err <= 1)
+		return err;
+	len = (size_t)err;
 	assert(len <= sizeof(hash));
 
-	len = sign_hash(imaevm_params.hash_algo, hash, len, key, NULL, sig + 1);
-	if (len <= 1)
-		return len;
-	assert(len < sizeof(sig));
-
-	/* add header */
-	len++;
 	if (evm_portable)
-		sig[0] = EVM_XATTR_PORTABLE_DIGSIG;
+		xattr_type = EVM_XATTR_PORTABLE_DIGSIG;
 	else
-		sig[0] = EVM_IMA_XATTR_DIGSIG;
+		xattr_type = EVM_IMA_XATTR_DIGSIG;
 
-	if (evm_immutable)
-		sig[1] = 3; /* immutable signature version */
+	switch (g_signature_version) {
+	case SIGNATURE_V3:
+		psig = sig;
+		err = imaevm_create_sigv3(hash_algo, hash, len, key, g_keypass,
+					  &psig, sizeof(sig), sigflags,
+					  xattr_type, &access_info,
+					  imaevm_keyid);
+		if (err <= 1)
+			return err;
+		len = (size_t)err;
+		assert(len <= sizeof(sig));
+		break;
+	case SIGNATURE_V2:
+		err = imaevm_signhash(hash_algo, hash, len, key, g_keypass,
+				      sig + 1, sigflags, &access_info, imaevm_keyid);
+		if (err <= 1)
+			return err;
+		len = (size_t)err;
+		assert(len <= sizeof(sig));
+		/* add header */
+		len++;
+		sig[0] = xattr_type;
+		break;
+	}
 
 	if (sigdump || imaevm_params.verbose >= LOG_INFO)
 		imaevm_hexdump(sig, len);
@@ -599,6 +613,10 @@ static int sign_evm(const char *file, const char *key)
 		if (err < 0) {
 			log_errno_reset(LOG_ERR, "Setting EVM xattr failed: %s",
 					file);
+			if (len >= 4096)
+				log_err("The signature with %zu bytes is likely too large for the file "
+					"extended attribute. Consider using a different key type.\n",
+					len);
 			return err;
 		}
 	}
@@ -609,11 +627,12 @@ static int sign_evm(const char *file, const char *key)
 static int hash_ima(const char *file)
 {
 	unsigned char hash[MAX_DIGEST_SIZE + 2]; /* +2 byte xattr header */
-	int len, err, offset;
-	int algo = imaevm_get_hash_algo(imaevm_params.hash_algo);
+	int err, offset;
+	size_t len;
+	int algo = imaevm_get_hash_algo(g_hash_algo);
 
 	if (algo < 0) {
-		log_err("Unknown hash algo: %s\n", imaevm_params.hash_algo);
+		log_err("Unknown hash algo: %s\n", g_hash_algo);
 		return -1;
 	}
 	if (algo > PKEY_HASH_SHA1) {
@@ -625,15 +644,17 @@ static int hash_ima(const char *file)
 		offset = 1;
 	}
 
-	len = ima_calc_hash(file, hash + offset);
-	if (len <= 1)
-		return len;
+	err = ima_calc_hash2(file, g_hash_algo, hash + offset);
+	if (err <= 1)
+		return err;
+
+	len = (size_t)err;
 	assert(len + offset <= sizeof(hash));
 
 	len += offset;
 
 	if (imaevm_params.verbose >= LOG_INFO)
-		log_info("hash(%s): ", imaevm_params.hash_algo);
+		log_info("hash(%s): ", g_hash_algo);
 
 	if (sigdump || imaevm_params.verbose >= LOG_INFO)
 		imaevm_hexdump(hash, len);
@@ -651,25 +672,49 @@ static int hash_ima(const char *file)
 	return 0;
 }
 
-static int sign_ima(const char *file, const char *key)
+static int sign_ima(const char *file, char *hash_algo, const char *key)
 {
 	unsigned char hash[MAX_DIGEST_SIZE];
 	unsigned char sig[MAX_SIGNATURE_SIZE];
-	int len, err;
+	unsigned char *psig;
+	size_t len;
+	int err;
 
-	len = ima_calc_hash(file, hash);
-	if (len <= 1)
-		return len;
+	err = ima_calc_hash2(file, hash_algo, hash);
+	if (err <= 1)
+		return err;
+	len = (size_t)err;
 	assert(len <= sizeof(hash));
 
-	len = sign_hash(imaevm_params.hash_algo, hash, len, key, NULL, sig + 1);
-	if (len <= 1)
-		return len;
-	assert(len < sizeof(sig));
-
-	/* add header */
-	len++;
-	sig[0] = EVM_IMA_XATTR_DIGSIG;
+	switch (g_signature_version) {
+	case SIGNATURE_V3:
+		psig = sig;
+		err = imaevm_create_sigv3(hash_algo, hash, len, key, g_keypass,
+					  &psig, sizeof(sig), sigflags,
+					  EVM_IMA_XATTR_DIGSIG, &access_info,
+					  imaevm_keyid);
+		if (err <= 1)
+			return err;
+		len = (size_t)err;
+		assert(len <= sizeof(sig));
+		break;
+	case SIGNATURE_V2:
+		err = imaevm_signhash(hash_algo, hash, len, key, g_keypass,
+				      sig + 1, sigflags, &access_info,
+				      imaevm_keyid);
+		if (err <= 1)
+			return err;
+		len = (size_t)err;
+		assert(len < sizeof(sig));
+		/* add header */
+		len++;
+		sig[0] = EVM_IMA_XATTR_DIGSIG;
+		break;
+	default:
+		log_err("Internal error: Unsupported signature version: %d\n",
+			g_signature_version);
+		return -1;
+	}
 
 	if (sigdump || imaevm_params.verbose >= LOG_INFO)
 		imaevm_hexdump(sig, len);
@@ -735,7 +780,11 @@ static int do_cmd(struct command *cmd, find_cb_t func)
 		}
 		err = find(path, dts, func);
 	} else {
-		err = func(path);
+		do {
+			err = func(path);
+			if (err)
+				return err;
+		} while ((path = g_argv[optind++]));
 	}
 
 	return err;
@@ -752,7 +801,7 @@ static int sign_ima_file(const char *file)
 
 	key = imaevm_params.keyfile ? : "/etc/keys/privkey_evm.pem";
 
-	return sign_ima(file, key);
+	return sign_ima(file, g_hash_algo, key);
 }
 
 static int cmd_sign_ima(struct command *cmd)
@@ -779,16 +828,17 @@ static int cmd_sign_ima(struct command *cmd)
  */
 static int cmd_sign_hash(struct command *cmd)
 {
-	unsigned char sigv3_hash[MAX_DIGEST_SIZE];
 	unsigned char sig[MAX_SIGNATURE_SIZE];
 	unsigned char hash[MAX_DIGEST_SIZE];
-	int siglen, algolen = 0, hashlen = 0;
+	size_t algolen = 0;
+	size_t hashlen = 0;
+	int siglen;
 	char *line = NULL, *token, *hashp;
+	unsigned char *psig;
 	size_t line_len = 0;
 	const char *key;
 	char algo[7];	/* Current maximum fsverity hash algo name length */
 	ssize_t len;
-	int ret;
 
 	key = imaevm_params.keyfile ? : "/etc/keys/privkey_evm.pem";
 
@@ -811,7 +861,7 @@ static int cmd_sign_hash(struct command *cmd)
 			if (hashp)	/* pointer to the delimiter */
 				algolen = hashp - line;
 
-			if (!hashp || algolen <= 0 ||
+			if (!hashp || algolen == 0 ||
 			    algolen >= sizeof(algo)) {
 				log_err("Missing/invalid fsverity hash algorithm\n");
 				continue;
@@ -836,37 +886,55 @@ static int cmd_sign_hash(struct command *cmd)
 			assert(hashlen / 2 <= sizeof(hash));
 			hex2bin(hash, hashp, hashlen / 2);
 
-			ret = calc_hash_sigv3(IMA_VERITY_DIGSIG, algo, hash,
-					      sigv3_hash);
-			if (ret < 0 || ret == 1) {
-				log_info("Failure to calculate fs-verity hash\n");
-				continue;
-			}
-
-			siglen = sign_hash(algo, sigv3_hash, hashlen / 2,
-					   key, NULL, sig + 1);
-
-			sig[0] = IMA_VERITY_DIGSIG;
-			sig[1] = DIGSIG_VERSION_3;	/* sigv3 */
+			psig = sig;
+			siglen = imaevm_create_sigv3(algo, hash,
+						     hashlen / 2, key, g_keypass,
+						     &psig, sizeof(sig), sigflags,
+						     IMA_VERITY_DIGSIG,
+						     &access_info, imaevm_keyid);
+			if (siglen <= 1)
+				return siglen;
+			assert(siglen <= (int)sizeof(sig));
 		} else {
 			/* Parse the shaXsum output */
 			token = strpbrk(line, " \t");
-			hashlen = token ? token - line : strlen(line);
+			hashlen = token ? (size_t)(token - line) : strlen(line);
 			assert(hashlen / 2 <= sizeof(hash));
 			hex2bin(hash, line, hashlen / 2);
 
-			siglen = sign_hash(imaevm_params.hash_algo, hash,
-					   hashlen / 2, key, NULL, sig + 1);
-			sig[0] = EVM_IMA_XATTR_DIGSIG;
+			switch (g_signature_version) {
+			case SIGNATURE_V3:
+				psig = sig;
+				siglen = imaevm_create_sigv3(g_hash_algo, hash,
+							     hashlen / 2, key, g_keypass,
+							     &psig, sizeof(sig), sigflags,
+							     EVM_IMA_XATTR_DIGSIG,
+							     &access_info, imaevm_keyid);
+				if (siglen <= 1)
+					return siglen;
+				assert(siglen <= (int)sizeof(sig));
+				break;
+			case SIGNATURE_V2:
+				siglen = imaevm_signhash(g_hash_algo, hash,
+							 hashlen / 2, key, g_keypass,
+							 sig + 1, sigflags,
+							 &access_info, imaevm_keyid);
+				if (siglen <= 1)
+					return siglen;
+				assert(siglen < (int)sizeof(sig));
+				siglen++;
+				sig[0] = EVM_IMA_XATTR_DIGSIG;
+				break;
+			default:
+				log_err("Internal error: Unsupported signature version: %d\n",
+					g_signature_version);
+				return -1;
+			}
 		}
-
-		if (siglen <= 1)
-			return siglen;
-		assert(siglen < sizeof(sig));
 
 		fwrite(line, len, 1, stdout);
 		fprintf(stdout, " ");
-		bin2hex(sig, siglen + 1, stdout);
+		bin2hex(sig, siglen, stdout);
 		fprintf(stdout, "\n");
 	}
 
@@ -875,7 +943,6 @@ static int cmd_sign_hash(struct command *cmd)
 		print_usage(cmd);
 		return -1;
 	}
-
 	return 0;
 }
 
@@ -887,7 +954,7 @@ static int sign_evm_path(const char *file)
 	key = imaevm_params.keyfile ? : "/etc/keys/privkey_evm.pem";
 
 	if (digsig) {
-		err = sign_ima(file, key);
+		err = sign_ima(file, g_hash_algo, key);
 		if (err)
 			return err;
 	}
@@ -898,7 +965,7 @@ static int sign_evm_path(const char *file)
 			return err;
 	}
 
-	return sign_evm(file, key);
+	return sign_evm(file, g_hash_algo, key);
 }
 
 static int cmd_sign_evm(struct command *cmd)
@@ -906,10 +973,11 @@ static int cmd_sign_evm(struct command *cmd)
 	return do_cmd(cmd, sign_evm_path);
 }
 
-static int verify_evm(const char *file)
+static int verify_evm(struct public_key_entry *public_keys, const char *file)
 {
 	unsigned char hash[MAX_DIGEST_SIZE];
 	unsigned char sig[MAX_SIGNATURE_SIZE];
+	const char *hash_algo = NULL;
 	int sig_hash_algo;
 	int mdlen;
 	int len;
@@ -927,7 +995,7 @@ static int verify_evm(const char *file)
 	}
 
 	if (sig[0] == EVM_XATTR_PORTABLE_DIGSIG) {
-		if (sig[1] != DIGSIG_VERSION_2) {
+		if (sig[1] != DIGSIG_VERSION_2 && sig[1] != DIGSIG_VERSION_3) {
 			log_err("Portable sig: invalid type\n");
 			return -1;
 		}
@@ -939,20 +1007,22 @@ static int verify_evm(const char *file)
 		log_err("unknown hash algo: %s\n", file);
 		return -1;
 	}
-	imaevm_params.hash_algo = imaevm_hash_algo_by_id(sig_hash_algo);
+	hash_algo = imaevm_hash_algo_by_id(sig_hash_algo);
 
-	mdlen = calc_evm_hash(file, hash);
+	mdlen = calc_evm_hash(file, hash_algo, hash);
 	if (mdlen <= 1)
 		return mdlen;
-	assert(mdlen <= sizeof(hash));
+	assert(mdlen <= (int)sizeof(hash));
 
-	return verify_hash(file, hash, mdlen, sig, len);
+	return imaevm_verify_hash(public_keys, file, hash_algo, hash,
+				  mdlen, sig, len);
 }
 
 static int cmd_verify_evm(struct command *cmd)
 {
+	struct public_key_entry *public_keys = NULL;
 	char *file = g_argv[optind++];
-	int err;
+	int err, fails = 0;
 
 	if (!file) {
 		log_err("Parameters missing\n");
@@ -960,23 +1030,37 @@ static int cmd_verify_evm(struct command *cmd)
 		return -1;
 	}
 
-	if (imaevm_params.x509) {
+	if (use_x509(sigflags)) {
 		if (imaevm_params.keyfile) /* Support multiple public keys */
-			init_public_keys(imaevm_params.keyfile);
+			err = imaevm_init_public_keys(imaevm_params.keyfile,
+						      &public_keys);
 		else			   /* assume read pubkey from x509 cert */
-			init_public_keys("/etc/keys/x509_evm.der");
+			err = imaevm_init_public_keys("/etc/keys/x509_evm.der",
+						      &public_keys);
+		if (err < 0) {
+			log_info("Failed loading public keys");
+			return err;
+		}
 	}
 
-	err = verify_evm(file);
-	if (!err && imaevm_params.verbose >= LOG_INFO)
-		log_info("%s: verification is OK\n", file);
-	return err;
+	do {
+		err = verify_evm(public_keys, file);
+		if (err)
+			fails++;
+		if (!err && imaevm_params.verbose >= LOG_INFO)
+			log_info("%s: verification is OK\n", file);
+	} while ((file = g_argv[optind++]));
+
+	imaevm_free_public_keys(public_keys);
+
+	return fails > 0;
 }
 
-static int verify_ima(const char *file)
+static int verify_ima(struct public_key_entry *public_keys, const char *file)
 {
 	unsigned char sig[MAX_SIGNATURE_SIZE];
-	int len;
+	size_t len;
+	int err;
 
 	if (sigfile) {
 		void *tmp = file2bin(file, "sig", &len);
@@ -993,27 +1077,22 @@ static int verify_ima(const char *file)
 		memcpy(sig, tmp, len);
 		free(tmp);
 	} else {
-		len = lgetxattr(file, xattr_ima, sig, sizeof(sig));
-		if (len < 0) {
+		err = lgetxattr(file, xattr_ima, sig, sizeof(sig));
+		if (err < 0) {
 			log_err("getxattr failed: %s\n", file);
-			return len;
+			return err;
 		}
+		len = (size_t)err;
 	}
 
-	return ima_verify_signature(file, sig, len, NULL, 0);
+	return ima_verify_signature2(public_keys, file, sig, len, NULL, 0);
 }
 
 static int cmd_verify_ima(struct command *cmd)
 {
+	struct public_key_entry *public_keys = NULL;
 	char *file = g_argv[optind++];
 	int err, fails = 0;
-
-	if (imaevm_params.x509) {
-		if (imaevm_params.keyfile) /* Support multiple public keys */
-			init_public_keys(imaevm_params.keyfile);
-		else			   /* assume read pubkey from x509 cert */
-			init_public_keys("/etc/keys/x509_evm.der");
-	}
 
 	if (!file) {
 		log_err("Parameters missing\n");
@@ -1021,13 +1100,28 @@ static int cmd_verify_ima(struct command *cmd)
 		return -1;
 	}
 
+	if (use_x509(sigflags)) {
+		if (imaevm_params.keyfile) /* Support multiple public keys */
+			err = imaevm_init_public_keys(imaevm_params.keyfile,
+						      &public_keys);
+		else			   /* assume read pubkey from x509 cert */
+			err = imaevm_init_public_keys("/etc/keys/x509_evm.der",
+						      &public_keys);
+		if (err < 0) {
+			log_info("Failed loading public keys");
+			return err;
+		}
+	}
+
 	do {
-		err = verify_ima(file);
+		err = verify_ima(public_keys, file);
 		if (err)
 			fails++;
 		if (!err && imaevm_params.verbose >= LOG_INFO)
 			log_info("%s: verification is OK\n", file);
 	} while ((file = g_argv[optind++]));
+
+	imaevm_free_public_keys(public_keys);
 	return fails > 0;
 }
 
@@ -1041,15 +1135,12 @@ static int cmd_convert(struct command *cmd)
 	uint8_t keyid[8];
 	RSA *key;
 
-	imaevm_params.x509 = 0;
-
 	inkey = g_argv[optind++];
 	if (!inkey) {
-		inkey = imaevm_params.x509 ? "/etc/keys/x509_evm.der" :
-					     "/etc/keys/pubkey_evm.pem";
+		inkey = "/etc/keys/pubkey_evm.pem";
 	}
 
-	key = read_pub_key(inkey, imaevm_params.x509);
+	key = read_pub_key(inkey, 0);
 	if (!key)
 		return 1;
 
@@ -1064,17 +1155,18 @@ static int cmd_convert(struct command *cmd)
 }
 #endif
 
-static int cmd_import(struct command *cmd)
+static int cmd_import(struct command *cmd __attribute__((unused)))
 {
 	char *inkey, *ring = NULL;
 	unsigned char _pub[1024], *pub = _pub;
-	int id, len, err = 0;
+	int id, err = 0;
+	size_t len;
 	char name[20];
 	uint8_t keyid[8];
 
 	inkey = g_argv[optind++];
 	if (!inkey) {
-		inkey = imaevm_params.x509 ? "/etc/keys/x509_evm.der" :
+		inkey = use_x509(sigflags) ? "/etc/keys/x509_evm.der" :
 					     "/etc/keys/pubkey_evm.pem";
 	} else
 		ring = g_argv[optind++];
@@ -1104,8 +1196,8 @@ static int cmd_import(struct command *cmd)
 		}
 	}
 
-	if (imaevm_params.x509) {
-		EVP_PKEY *pkey = read_pub_pkey(inkey, imaevm_params.x509);
+	if (use_x509(sigflags)) {
+		EVP_PKEY *pkey = read_pub_pkey(inkey, 1);
 
 		if (!pkey)
 			return 1;
@@ -1118,7 +1210,7 @@ static int cmd_import(struct command *cmd)
 		EVP_PKEY_free(pkey);
 	} else {
 #if CONFIG_SIGV1
-		RSA *key = read_pub_key(inkey, imaevm_params.x509);
+		RSA *key = read_pub_key(inkey, 0);
 
 		if (!key)
 			return 1;
@@ -1133,8 +1225,8 @@ static int cmd_import(struct command *cmd)
 
 	log_info("Importing public key %s from file %s into keyring %d\n", name, inkey, id);
 
-	id = add_key(imaevm_params.x509 ? "asymmetric" : "user",
-		     imaevm_params.x509 ? NULL : name, pub, len, id);
+	id = add_key(use_x509(sigflags) ? "asymmetric" : "user",
+		     use_x509(sigflags) ? NULL : name, pub, len, id);
 	if (id < 0) {
 		log_err("add_key failed\n");
 		err = id;
@@ -1150,7 +1242,8 @@ static int cmd_import(struct command *cmd)
 static int setxattr_ima(const char *file, char *sig_file)
 {
 	unsigned char *sig;
-	int len, err;
+	size_t len;
+	int err;
 
 	if (sig_file)
 		sig = file2bin(sig_file, NULL, &len);
@@ -1197,9 +1290,10 @@ static int calc_evm_hmac(const char *file, const char *keyfile, unsigned char *s
 	char **xattrname;
 	unsigned char xattr_value[1024];
 	unsigned char *key;
-	int keylen;
+	size_t keylen;
 	unsigned char evmkey[MAX_KEY_SIZE];
 	char list[1024];
+	char uuid[16];
 	ssize_t list_size;
 	struct h_misc_64 hmac_misc;
 	int hmac_size;
@@ -1215,7 +1309,7 @@ static int calc_evm_hmac(const char *file, const char *keyfile, unsigned char *s
 	}
 
 	if (keylen > sizeof(evmkey)) {
-		log_err("key is too long: %d\n", keylen);
+		log_err("key is too long: %zu\n", keylen);
 		goto out;
 	}
 
@@ -1229,7 +1323,11 @@ static int calc_evm_hmac(const char *file, const char *keyfile, unsigned char *s
 		goto out;
 	}
 
-	if (S_ISREG(st.st_mode)) {
+	if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) {
+		/*
+		 * We cannot at the moment get generation of special files..
+		 * kernel API does not support it.
+		 */
 		int fd = open(file, 0);
 
 		if (fd < 0) {
@@ -1331,6 +1429,18 @@ static int calc_evm_hmac(const char *file, const char *keyfile, unsigned char *s
 		log_err("EVP_DigestSignUpdate() failed\n");
 		goto out_ctx_cleanup;
 	}
+	if (!(hmac_flags & HMAC_FLAG_NO_UUID)) {
+		err = get_uuid(&st, uuid);
+		if (err)
+			goto out_ctx_cleanup;
+
+		err = EVP_DigestSignUpdate(pctx, (const unsigned char *)uuid,
+					   sizeof(uuid));
+		if (!err) {
+			log_err("EVP_DigestSignUpdate() failed\n");
+			goto out_ctx_cleanup;
+		}
+	}
 	err = EVP_DigestSignFinal(pctx, sig, &siglen);
 	if (err != 1)
 		log_err("EVP_DigestSignFinal() failed\n");
@@ -1350,11 +1460,14 @@ static int hmac_evm(const char *file, const char *key)
 {
 	unsigned char hash[MAX_DIGEST_SIZE];
 	unsigned char sig[MAX_SIGNATURE_SIZE];
-	int len, err;
+	size_t len;
+	int err;
 
-	len = calc_evm_hmac(file, key, hash);
-	if (len <= 1)
-		return len;
+	err = calc_evm_hmac(file, key, hash);
+	if (err <= 1)
+		return err;
+
+	len = (size_t)err;
 	assert(len <= sizeof(hash));
 
 	log_info("hmac: ");
@@ -1390,7 +1503,7 @@ static int cmd_hmac_evm(struct command *cmd)
 	key = imaevm_params.keyfile ? : "/etc/keys/privkey_evm.pem";
 
 	if (digsig) {
-		err = sign_ima(file, key);
+		err = sign_ima(file, g_hash_algo, key);
 		if (err)
 			return err;
 	}
@@ -1401,7 +1514,8 @@ static int cmd_hmac_evm(struct command *cmd)
 			return err;
 	}
 
-	return hmac_evm(file, "/etc/keys/evm-key-plain");
+	return hmac_evm(file, imaevm_params.hmackeyfile ? :
+			"/etc/keys/evm-key-plain");
 }
 
 static int ima_fix(const char *path)
@@ -1514,7 +1628,7 @@ static int cmd_ima_clear(struct command *cmd)
 struct template_entry {
 	struct {
 		uint32_t pcr;
-		uint8_t digest[SHA_DIGEST_LENGTH];
+		uint8_t digest[MAX_DIGEST_SIZE];
 		uint32_t name_len;
 	} header  __packed;
 	char name[TCG_EVENT_NAME_LEN_MAX + 1];
@@ -1527,19 +1641,25 @@ static uint8_t zero[MAX_DIGEST_SIZE];
 
 static int ignore_violations = 0;
 
-static int ima_verify_template_hash(struct template_entry *entry)
+static int ima_verify_template_hash(struct template_entry *entry,
+				    const EVP_MD *md)
 {
-	uint8_t digest[SHA_DIGEST_LENGTH];
+	uint8_t digest[MAX_DIGEST_SIZE];
+	unsigned int digest_len;
 	static int line = 0;
 
 	line++;
 
-	if (!memcmp(zero, entry->header.digest, sizeof(digest)))
+	if (!memcmp(zero, entry->header.digest, EVP_MD_size(md)))
 		return 0;
 
-	SHA1(entry->template, entry->template_len, digest);
+	if (EVP_Digest(entry->template, entry->template_len, digest, &digest_len,
+		       md, NULL) != 1) {
+		log_err("EVP_Digest failed.\n");
+		return 1;
+	}
 
-	if (memcmp(digest, entry->header.digest, sizeof(digest))) {
+	if (memcmp(digest, entry->header.digest, digest_len)) {
 		if (imaevm_params.verbose > LOG_INFO)
 			log_info("Failed to verify template data digest(line %d).\n",
 				  line);
@@ -1549,16 +1669,16 @@ static int ima_verify_template_hash(struct template_entry *entry)
 	return 0;
 }
 
-void ima_show(struct template_entry *entry)
+void ima_show(struct template_entry *entry, size_t entry_digest_len)
 {
 	if (imaevm_params.verbose <= LOG_INFO)
 		return;
 
 	log_info("%d ", entry->header.pcr);
-	log_dump_n(entry->header.digest, sizeof(entry->header.digest));
+	log_dump_n(entry->header.digest, entry_digest_len);
 	log_info(" %s ", entry->name);
-	log_dump_n(entry->template, SHA_DIGEST_LENGTH);
-	log_info(" %s\n", entry->template + SHA_DIGEST_LENGTH);
+	log_dump_n(entry->template, entry_digest_len);
+	log_info(" %s\n", entry->template + entry_digest_len);
 }
 
 /*
@@ -1589,11 +1709,13 @@ static int lookup_template_name_entry(char *template_name)
 	return 0;
 }
 
-void ima_ng_show(struct template_entry *entry)
+static void ima_ng_show(struct public_key_entry *public_keys,
+			struct template_entry *entry, size_t entry_digest_len)
 {
 	uint8_t *fieldp = entry->template;
 	uint32_t field_len;
-	int total_len = entry->template_len, digest_len, len, fbuf_len;
+	uint32_t total_len = entry->template_len;
+	int digest_len, len, fbuf_len = 0;
 	uint8_t *digest, *sig = NULL, *fbuf = NULL;
 	int sig_len = 0;
 	char *algo, *path;
@@ -1601,14 +1723,25 @@ void ima_ng_show(struct template_entry *entry)
 	int err;
 
 	/* get binary digest */
-	field_len = *(uint32_t *)fieldp;
-	fieldp += sizeof(field_len);
-	total_len -= sizeof(field_len);
-	if (total_len < 0) {
+	if (total_len < sizeof(field_len)) {
 		log_err("Template \"%s\" invalid template data\n", entry->name);
 		return;
 	}
 
+	/*
+	 * A cast to a uint32_t pointer is endian safe when the endian-ness
+	 * of the platform is the same as the endian-ness of the event log.
+	 */
+	field_len = *(uint32_t *)fieldp;
+	fieldp += sizeof(field_len);
+	total_len -= sizeof(field_len);
+
+	if (field_len == 0 || total_len < field_len) {
+		log_err("Template \"%s\" invalid template data\n", entry->name);
+		return;
+	}
+
+	/* parse the binary digest field: <hash algo>:<digest> */
 	algo = (char *)fieldp;
 	len = strnlen(algo, field_len - 1) + 1;
 	digest_len = field_len - len;
@@ -1622,43 +1755,43 @@ void ima_ng_show(struct template_entry *entry)
 	/* move to next field */
 	fieldp += field_len;
 	total_len -= field_len;
-	if (total_len < 0) {
-		log_err("Template \"%s\" invalid template data\n", entry->name);
-		return;
-	}
 
 	/* get path */
+	if (total_len < sizeof(field_len)) {
+		log_err("Template \"%s\" invalid file pathname\n", entry->name);
+		return;
+	}
 	field_len = *(uint32_t *)fieldp;
 	fieldp += sizeof(field_len);
 	total_len -= sizeof(field_len);
+
 	if (field_len == 0 || field_len > PATH_MAX || total_len < field_len) {
 		log_err("Template \"%s\" invalid file pathname\n", entry->name);
 		return;
 	}
-
 	path = (char *)fieldp;
 
 	/* move to next field */
 	fieldp += field_len;
 	total_len -= field_len;
-	if (total_len < 0) {
-		log_err("Template \"%s\" invalid template data\n", entry->name);
-		return;
-	}
 
 	if (!strcmp(entry->name, "ima-sig") ||
 	    !strcmp(entry->name, "ima-sigv2")) {
 		/* get signature, if it exists */
+		if (total_len < sizeof(field_len))
+			return;
+
 		field_len = *(uint32_t *)fieldp;
 		fieldp += sizeof(field_len);
+		total_len -= sizeof(field_len);
+
 		if (field_len > MAX_SIGNATURE_SIZE) {
 			log_err("Template \"%s\" invalid file signature size\n",
 				entry->name);
 			return;
 		}
 
-		total_len -= sizeof(field_len);
-		if (total_len < 0) {
+		if (total_len < field_len) {
 			log_err("Template \"%s\" invalid template data\n",
 				entry->name);
 			return;
@@ -1673,9 +1806,19 @@ void ima_ng_show(struct template_entry *entry)
 			total_len -= field_len;
 		}
 	} else if (!strcmp(entry->name, "ima-buf")) {
+		if (total_len < sizeof(field_len))
+			return;
+
 		field_len = *(uint32_t *)fieldp;
 		fieldp += sizeof(field_len);
 		total_len -= sizeof(field_len);
+
+		if (total_len < field_len) {
+			log_err("Template \"%s\" invalid template data\n",
+				entry->name);
+			return;
+		}
+
 		if (field_len) {
 			fbuf = fieldp;
 			fbuf_len = field_len;
@@ -1686,7 +1829,7 @@ void ima_ng_show(struct template_entry *entry)
 		}
 	}
 
-	if (total_len < 0) {
+	if (total_len != 0) {
 		log_err("Template \"%s\" invalid template data\n", entry->name);
 		return;
 	}
@@ -1694,7 +1837,7 @@ void ima_ng_show(struct template_entry *entry)
 	/* ascii_runtime_measurements */
 	if (imaevm_params.verbose > LOG_INFO) {
 		log_info("%d ", entry->header.pcr);
-		log_dump_n(entry->header.digest, sizeof(entry->header.digest));
+		log_dump_n(entry->header.digest, entry_digest_len);
 		log_info(" %s %s", entry->name, algo);
 		log_dump_n(digest, digest_len);
 		log_info(" %s", path);
@@ -1715,10 +1858,12 @@ void ima_ng_show(struct template_entry *entry)
 		 * the measurement list or calculate the hash.
 		 */
 		if (verify_list_sig)
-			err = ima_verify_signature(path, sig, sig_len,
-						   digest, digest_len);
+			err = ima_verify_signature2(public_keys, path,
+						    sig, sig_len,
+						    digest, digest_len);
 		else
-			err = ima_verify_signature(path, sig, sig_len, NULL, 0);
+			err = ima_verify_signature2(public_keys, path,
+						    sig, sig_len, NULL, 0);
 
 		if (!err && imaevm_params.verbose > LOG_INFO)
 			log_info("%s: verification is OK\n", path);
@@ -1751,8 +1896,7 @@ static void set_bank_info(struct tpm_bank_info *bank, const char *algo_name)
 static struct tpm_bank_info *init_tpm_banks(int *num_banks)
 {
 	struct tpm_bank_info *banks = NULL;
-	const char *default_algos[] = {"sha1", "sha256"};
-	int num_algos = sizeof(default_algos) / sizeof(default_algos[0]);
+	size_t num_algos = ARRAY_SIZE(default_algos);
 	int i, j;
 
 	banks = calloc(num_algos, sizeof(struct tpm_bank_info));
@@ -1803,7 +1947,7 @@ static int compare_tpm_banks(int num_banks, struct tpm_bank_info *bank,
 				     bank[i].digest_size) != 0)
 				ret = 1;
 
-			if ((!ret && imaevm_params.verbose <= LOG_INFO) ||
+			if ((!ret && imaevm_params.verbose < LOG_INFO) ||
 			    (ret && imaevm_params.verbose <= LOG_DEBUG))
 				continue;
 
@@ -1891,7 +2035,9 @@ out:
 }
 
 /* Calculate and extend the template hash for multiple hash algorithms */
-static void extend_tpm_banks(struct template_entry *entry, int num_banks,
+static void extend_tpm_banks(struct template_entry *entry,
+			     size_t entry_digest_len,
+			     int num_banks,
 			     struct tpm_bank_info *bank,
 			     struct tpm_bank_info *padded_bank)
 {
@@ -1927,7 +2073,7 @@ static void extend_tpm_banks(struct template_entry *entry, int num_banks,
 		 * per TPM bank digest, violations are the full per bank digest
 		 * size.
 		 */
-		if (memcmp(entry->header.digest, zero, SHA_DIGEST_LENGTH) == 0) {
+		if (memcmp(entry->header.digest, zero, entry_digest_len) == 0) {
 			if (!ignore_violations) {
 				memset(bank[i].digest, 0x00, bank[i].digest_size);
 				memset(padded_bank[i].digest, 0x00, padded_bank[i].digest_size);
@@ -1974,7 +2120,7 @@ static void extend_tpm_banks(struct template_entry *entry, int num_banks,
 static int read_one_bank(struct tpm_bank_info *tpm_bank, FILE *fp)
 {
 	char *p, pcr_str[8], buf[MAX_DIGEST_SIZE * 2 + 8];
-	int i = 0;
+	unsigned short i = 0;
 	int result = -1;
 	for (;;) {
 		p = fgets(buf, sizeof(buf), fp);
@@ -2073,13 +2219,14 @@ static int read_sysfs_tpm2_pcrs(int num_banks, struct tpm_bank_info *tpm_banks)
 }
 
 /* Read PCRs from per-bank file(s) specified via --pcrs */
-static int read_file_pcrs(int num_banks, struct tpm_bank_info *tpm_banks)
+static int read_file_pcrs(unsigned int num_banks, struct tpm_bank_info *tpm_banks)
 {
 	struct stat s;
 	FILE *fp;
 	char *p;
 	const char *alg, *path;
-	int i, j, bank, result;
+	unsigned int i, j;
+	int bank, result;
 
 	for (i = 0; i < num_banks; i++)
 		tpm_banks[i].supported = 0;
@@ -2187,8 +2334,51 @@ static int read_tpm_banks(int num_banks, struct tpm_bank_info *bank)
 	return tpm_enabled ? 0 : 1;
 }
 
+static const EVP_MD *get_digestbylogfile(const char *filename)
+{
+	size_t num_algos = ARRAY_SIZE(default_algos);
+	char buffer[PATH_MAX] = {0};
+	const char *start;
+	struct stat stbuf;
+	size_t i, len;
+
+	if (lstat(filename, &stbuf) < 0) {
+		log_err("Could not stat %s: %s\n",
+			filename, strerror(errno));
+		return NULL;
+	}
+	if ((stbuf.st_mode & S_IFMT) == S_IFLNK) {
+		if (readlink(filename, buffer, sizeof(buffer)) < 0) {
+			log_err("readlink on %s failed: %s\n",
+				filename, strerror(errno));
+			return NULL;
+		}
+
+		/* In case PATH_MAX bytes are actually read */
+		buffer[sizeof(buffer) - 1] = '\0';
+	} else {
+		len = snprintf(buffer, sizeof(buffer), "%s", filename);
+		if (len >= sizeof(buffer)) {
+			log_err("buffer is to small to hold filename\n");
+			return NULL;
+		}
+	}
+
+	for (i = 0; i < num_algos; i++) {
+		start = strstr(buffer, default_algos[i]);
+		/* filename must end with the string */
+		if (start && strcmp(start, default_algos[i]) == 0)
+			return EVP_get_digestbyname(default_algos[i]);
+	}
+
+	log_err("Unsupported algorithm used in log file %s.\n", filename);
+
+	return NULL;
+}
+
 static int ima_measurement(const char *file)
 {
+	struct public_key_entry *public_keys = NULL;
 	struct tpm_bank_info *pseudo_padded_banks;
 	struct tpm_bank_info *pseudo_banks = NULL;
 	struct tpm_bank_info *tpm_banks = NULL;
@@ -2201,6 +2391,8 @@ static int ima_measurement(const char *file)
 	int c;
 
 	struct template_entry entry = { .template = NULL };
+	size_t entry_digest_len = SHA_DIGEST_LENGTH;
+	const EVP_MD *md;
 	FILE *fp;
 	int invalid_template_digest = 0;
 	int err_padded = -1;
@@ -2223,14 +2415,25 @@ static int ima_measurement(const char *file)
 	fp = fopen(file, "rb");
 	if (!fp) {
 		log_err("Failed to open measurement file: %s\n", file);
-		goto out;
+		goto out_free;
 	}
 
+	md = get_digestbylogfile(file);
+	if (!md)
+		goto out_free;
+	entry_digest_len = EVP_MD_size(md);
+
 	if (imaevm_params.keyfile)	/* Support multiple public keys */
-		init_public_keys(imaevm_params.keyfile);
+		err = imaevm_init_public_keys(imaevm_params.keyfile,
+					      &public_keys);
 	else				/* assume read pubkey from x509 cert */
-		init_public_keys("/etc/keys/x509_evm.der");
-	if (errno)
+		err = imaevm_init_public_keys("/etc/keys/x509_evm.der",
+					      &public_keys);
+	/*
+	 * Without public keys, cannot validate signatures, but can
+	 * still calculate and verify the measurement list against TPM PCRs.
+	 */
+	if (errno || err < 0)
 		log_errno_reset(LOG_DEBUG,
 				"Failure in initializing public keys");
 
@@ -2252,11 +2455,12 @@ static int ima_measurement(const char *file)
 		    && strcmp(pseudo_padded_banks[c].algo_name, verify_bank)) {
 			pseudo_banks_mask ^= (1 << c);
 			pseudo_padded_banks_mask ^= (1 << c);
-			break;
 		}
 	}
 
-	while (fread(&entry.header, sizeof(entry.header), 1, fp) == 1) {
+	while (fread(&entry.header.pcr, sizeof(entry.header.pcr), 1, fp) == 1 &&
+	       fread(&entry.header.digest, entry_digest_len, 1, fp) == 1 &&
+	       fread(&entry.header.name_len, sizeof(entry.header.name_len), 1, fp) == 1) {
 		entry_num++;
 		if (entry.header.pcr >= NUM_PCRS) {
 			log_err("Invalid PCR %d.\n", entry.header.pcr);
@@ -2305,7 +2509,7 @@ static int ima_measurement(const char *file)
 				goto out;
 			}
 		} else {
-			entry.template_len = SHA_DIGEST_LENGTH +
+			entry.template_len = entry_digest_len +
 					     TCG_EVENT_NAME_LEN_MAX + 1;
 		}
 
@@ -2333,7 +2537,7 @@ static int ima_measurement(const char *file)
 			 * The "ima" template data format is digest,
 			 * filename length, filename.
 			 */
-			if (fread(entry.template, SHA_DIGEST_LENGTH,
+			if (fread(entry.template, entry_digest_len,
 				  1, fp) != 1) {
 				log_errno("Unable to read file data hash\n");
 				goto out;
@@ -2353,7 +2557,7 @@ static int ima_measurement(const char *file)
 				goto out;
 			}
 
-			len = fread(entry.template + SHA_DIGEST_LENGTH,
+			len = fread(entry.template + entry_digest_len,
 				    field_len, 1, fp);
 			if (len != 1) {
 				log_errno("Failed reading file name\n");
@@ -2364,23 +2568,24 @@ static int ima_measurement(const char *file)
 			 * The template data is fixed sized, zero out
 			 * the remaining memory.
 			 */
-			len = SHA_DIGEST_LENGTH + field_len;
+			len = entry_digest_len + field_len;
 			memset(entry.template + len, 0x00,
 			       entry.template_buf_len - len);
 		}
 
-		extend_tpm_banks(&entry, num_banks, pseudo_banks,
+		extend_tpm_banks(&entry, entry_digest_len,
+				 num_banks, pseudo_banks,
 				 pseudo_padded_banks);
 
 		/* Recalculate and verify template data digest */
-		err = ima_verify_template_hash(&entry);
+		err = ima_verify_template_hash(&entry, md);
 		if (err)
 			invalid_template_digest = 1;
 
 		if (is_ima_template)
-			ima_show(&entry);
+			ima_show(&entry, entry_digest_len);
 		else
-			ima_ng_show(&entry);
+			ima_ng_show(public_keys, &entry, entry_digest_len);
 
 		if (!tpmbanks)
 			continue;
@@ -2418,13 +2623,13 @@ static int ima_measurement(const char *file)
 	if (tpmbanks == 0)
 		log_info("Failed to read any TPM PCRs\n");
 	else {
-		if (!err)
-			log_info("Matched per TPM bank calculated digest(s).\n");
+		if (!err && entry_num)
+			log_notice("Matched per TPM bank calculated digest(s).\n");
 		else if (!err_padded) {
-			log_info("Matched SHA1 padded TPM digest(s).\n");
+			log_notice("Matched SHA1 padded TPM digest(s).\n");
 			err = 0;
 		} else
-			log_info("Failed to match per TPM bank or SHA1 padded TPM digest(s).\n");
+			log_notice("Failed to match per TPM bank or SHA1 padded TPM digest(s).\n");
 	}
 
 	if (invalid_template_digest) {
@@ -2439,6 +2644,7 @@ out_free:
 	free(pseudo_banks);
 	free(pseudo_padded_banks);
 	free(entry.template);
+	imaevm_free_public_keys(public_keys);
 
 	return err;
 }
@@ -2667,7 +2873,7 @@ static int append_bootaggr(char *bootaggr, struct tpm_bank_info *tpm_banks)
  * 0 - 9 to validate against the IMA boot_aggregate record. If the digest
  * algorithm is SHA1, only PCRs 0 - 7 are considered to avoid ambiguity.
  */
-static int cmd_ima_bootaggr(struct command *cmd)
+static int cmd_ima_bootaggr(struct command *cmd __attribute__((unused)))
 {
 	struct tpm_bank_info *tpm_banks;
 	int bootaggr_len = 0;
@@ -2727,6 +2933,10 @@ static int cmd_ima_bootaggr(struct command *cmd)
 	}
 	/* Make room for the trailing null */
 	bootaggr = malloc(bootaggr_len + 1);
+	if (!bootaggr) {
+		log_err("errno: %s (%d)\n", strerror(errno), errno);
+		return -1;
+	}
 
 	/*
 	 * Calculate and convert the per TPM 2.0 PCR bank algorithm
@@ -2749,89 +2959,111 @@ static int cmd_ima_bootaggr(struct command *cmd)
 	return 0;
 }
 
-static int ima_sig_import_v2(const char *hashalgo, const char *keyfile, const char *rawsigfile, const char *file)
+/*
+ * ima_sig_import: build the security.ima xattr (IMA signature v2) from a raw
+ * signature made elsewhere, e.g. by "openssl dgst -sign" on a PKCS#11 token,
+ * so that the private key never has to be available to evmctl.
+ *
+ * rawsigfile holds the bare signature over the file's digest (hash algorithm
+ * given with -a); the public key (--key, an X.509 certificate) only supplies
+ * the key id in the header, unless --keyid/--keyid-from-cert gives it.  The
+ * signature is not verified here - use ima_verify for that.
+ */
+static int ima_sig_import_v2(const char *hash_algo, const char *keyfile,
+			     const char *rawsigfile, const char *file)
 {
- unsigned char *rawsig;
- int rawsigsz, len, ret = 0, memlock_len;
- unsigned char sig[1024] = "\x03";
- char name[20];
- struct signature_v2_hdr *hdr = (struct signature_v2_hdr *)(sig + 1);
- EVP_PKEY *key;
+	unsigned char sig[MAX_SIGNATURE_SIZE];
+	struct signature_v2_hdr *hdr = (struct signature_v2_hdr *)(sig + 1);
+	unsigned char *rawsig;
+	size_t rawsigsz, len;
+	EVP_PKEY *pkey = NULL;
+	uint32_t keyid;
+	char name[20];
+	int algo, ret = 1;
 
- rawsig = file2bin(rawsigfile, NULL, &rawsigsz);
- if (!rawsig) {
-  log_err("Unable to read file %s\n", rawsigfile);
-  return 1;
- }
+	algo = imaevm_get_hash_algo(hash_algo);
+	if (algo < 0) {
+		log_err("Unknown hash algo: %s\n", hash_algo);
+		return 1;
+	}
 
- key = read_pub_pkey(keyfile, imaevm_params.x509);
- if (!key) {
-  free(rawsig);
-  return 1;
- }
+	rawsig = file2bin(rawsigfile, NULL, &rawsigsz);
+	if (!rawsig) {
+		log_err("Unable to read file %s\n", rawsigfile);
+		return 1;
+	}
 
- hdr->version = 2;
- hdr->hash_algo = imaevm_get_hash_algo(hashalgo);
+	if (rawsigsz == 0 ||
+	    rawsigsz > sizeof(sig) - 1 - sizeof(struct signature_v2_hdr)) {
+		log_err("Raw signature has an invalid size (%zu bytes): %s\n",
+			rawsigsz, rawsigfile);
+		goto out;
+	}
 
- calc_keyid_v2(&hdr->keyid, name, key);
- memcpy(hdr->sig, rawsig, rawsigsz);
+	if (imaevm_keyid) {
+		keyid = htonl(imaevm_keyid);
+	} else {
+		pkey = read_pub_pkey(keyfile, 1);
+		if (!pkey)
+			goto out;
+		calc_keyid_v2(&keyid, name, pkey);
+	}
 
- len = rawsigsz;
- hdr->sig_size = __cpu_to_be16(len);
- len += sizeof(*hdr);
- log_info("evm/ima signature: %d bytes\n", len);
- if (sigdump || imaevm_params.verbose >= LOG_INFO)
-  imaevm_hexdump(sig + 1, len);
+	sig[0] = EVM_IMA_XATTR_DIGSIG;
+	hdr->version = 2;
+	hdr->hash_algo = (uint8_t)algo;
+	hdr->keyid = keyid;
+	hdr->sig_size = htons((uint16_t)rawsigsz);
+	memcpy(hdr->sig, rawsig, rawsigsz);
 
- /* Add ima header */
- len++;
-#if 0
- if (memlock) {
-  memlock_len = add_memlock_info(sig + len);
-  len += memlock_len;
- }
-#endif
+	len = sizeof(*hdr) + rawsigsz;
+	log_info("evm/ima signature: %zu bytes\n", len);
+	if (sigdump || imaevm_params.verbose >= LOG_INFO)
+		imaevm_hexdump(sig + 1, len);
 
- if (sigfile)
-  bin2file(file, "sig", sig, len);
+	/* add the xattr type byte */
+	len++;
 
- if (xattr) {
-  ret = setxattr(file, "security.ima", sig, len, 0); 
-  if (ret < 0) {
-   log_err("setxattr failed: %s\n", file);
-   goto out;
-  }
- }
+	if (sigfile)
+		bin2file(file, "sig", sig, len);
 
+	if (xattr) {
+		if (setxattr(file, xattr_ima, sig, len, 0) < 0) {
+			log_errno_reset(LOG_ERR, "Setting IMA xattr failed: %s",
+					file);
+			goto out;
+		}
+	}
+
+	ret = 0;
 out:
- EVP_PKEY_free(key);
- free(rawsig);
- return ret;
+	EVP_PKEY_free(pkey);
+	free(rawsig);
+	return ret;
 }
 
 static int cmd_ima_sig_import(struct command *cmd)
 {
- char *rawsigfile, *file, *key;
+	char *rawsigfile, *file;
+	const char *key;
 
- rawsigfile = g_argv[optind++];
- file = g_argv[optind++];
+	rawsigfile = g_argv[optind++];
+	file = g_argv[optind++];
 
- if (!file || !rawsigfile) {
-  log_err("Parameters missing\n");
-  print_usage(cmd);
-  return -1;
- }
+	if (!rawsigfile || !file) {
+		log_err("Parameters missing\n");
+		print_usage(cmd);
+		return -1;
+	}
 
- key = imaevm_params.keyfile ? : imaevm_params.x509 ?
-   "/etc/keys/x509_evm.der" :
-   "/etc/keys/pubkey_evm.pem";
+	if (!use_x509(sigflags)) {
+		log_err("Signature version 1 import not supported.\n");
+		return 1;
+	}
 
- if (imaevm_params.x509)
-  return ima_sig_import_v2(imaevm_params.hash_algo, key, rawsigfile, file);
- else {
-  log_err("Signature version 1 import not supported.\n");
-  return 1;
- }
+	key = imaevm_params.keyfile ? : "/etc/keys/x509_evm.der";
+
+	return ima_sig_import_v2(g_hash_algo, key, rawsigfile, file);
 }
 
 static void print_usage(struct command *cmd)
@@ -2880,7 +3112,7 @@ static int call_command(struct command *cmds, char *command)
 	struct command *cmd;
 
 	for (cmd = cmds; cmd->name; cmd++) {
-		if (strcasecmp(cmd->name, command) == 0)
+		if (ascii_strcasecmp(cmd->name, command) == 0)
 			return cmd->func(cmd);
 	}
 	printf("Invalid command: %s\n", command);
@@ -2919,7 +3151,7 @@ static void usage(void)
 		"      --keyid-from-cert file\n"
 		"                     read keyid value from SKID of a x509 cert file\n"
 		"  -o, --portable     generate portable EVM signatures\n"
-		"  -p, --pass         password for encrypted signing key\n"
+		"  -p, --pass         password for encrypted signing; use -p<password>\n"
 		"  -r, --recursive    recurse into directories (sign)\n"
 		"  -t, --type         file types to fix 'fxm' (f: file)\n"
 		"                     x - skip fixing if both ima and evm xattrs exist (use with caution)\n"
@@ -2941,8 +3173,17 @@ static void usage(void)
 #if CONFIG_IMA_EVM_ENGINE
 		"      --engine e     preload OpenSSL engine e (such as: gost) is deprecated\n"
 #endif
+#if CONFIG_IMA_EVM_PROVIDER
+		"      --provider p   preload OpenSSL provider (such as: pkcs11)\n"
+#endif
 		"      --ignore-violations ignore ToMToU measurement violations\n"
+#ifdef DEBUG
+		"      --hmackey      path to symmetric key (default: /etc/keys/evm-key-plain)\n"
+#endif
+		"      --v2           create V2 signatures; this is the default\n"
+		"      --v3           create V3 signatures; this requires Linux 7.2 or later\n"
 		"  -v                 increase verbosity level\n"
+		"      --log-level l  set verbosity to level l: err, warning, notice, info, debug\n"
 		"  -h, --help         display this help and exit\n"
 		"\n"
 		"Environment variables:\n\n"
@@ -2951,8 +3192,8 @@ static void usage(void)
 }
 
 struct command cmds[] = {
-	{"--version", NULL, 0, ""},
-	{"help", cmd_help, 0, "<command>"},
+	{"--version", NULL, 0, "", ""},
+	{"help", cmd_help, 0, "<command>", ""},
 #if CONFIG_SIGV1
 	{"import", cmd_import, 0, "[--rsa (deprecated)] pubkey keyring", "Import public key into the keyring.\n"},
 	{"convert", cmd_convert, 0, "key", "convert public key into the keyring. (deprecated)\n"},
@@ -2970,11 +3211,9 @@ struct command cmds[] = {
 	{"ima_fix", cmd_ima_fix, 0, "[-t fdsxm] path", "Recursively fix IMA/EVM xattrs in fix mode.\n"},
 	{"ima_clear", cmd_ima_clear, 0, "[-t fdsxm] path", "Recursively remove IMA/EVM xattrs.\n"},
 	{"sign_hash", cmd_sign_hash, 0, "[--veritysig] [--key key] [--pass[=<password>]]", "Sign hashes from either shaXsum or \"fsverity digest\" output.\n"},
-#ifdef DEBUG
-	{"hmac", cmd_hmac_evm, 0, "[--imahash | --imasig ] file", "Sign file metadata with HMAC using symmetric key (for testing purpose).\n"},
-#endif
-	{"ima_sig_import", cmd_ima_sig_import, 0, "[--x509] [-a hashalgo] [-k pubkey] signature file", "Make IMA si    gnature from externally signed raw signature blob.\n"},
-	{0, 0, 0, NULL}
+	{"hmac", cmd_hmac_evm, 0, "[--imahash | --imasig] [--hmackey key] file", "Sign file metadata with HMAC using symmetric key (for testing purpose).\n"},
+	{"ima_sig_import", cmd_ima_sig_import, 0, "[-a hash-algorithm] [--key cert] [--keyid id | --keyid-from-cert file] [--sigfile] signature file", "Make the IMA signature xattr from an externally made raw signature.\n"},
+	{0, 0, 0, NULL, ""}
 };
 
 static struct option opts[] = {
@@ -3009,11 +3248,18 @@ static struct option opts[] = {
 	{"xattr-user", 0, 0, 140},
 	{"ignore-violations", 0, 0, 141},
 	{"pcrs", 1, 0, 142},
-	{"verify-bank", 2, 0, 143},
+	{"verify-bank", 1, 0, 143},
 	{"keyid", 1, 0, 144},
 	{"keyid-from-cert", 1, 0, 145},
 	{"veritysig", 0, 0, 146},
 	{"hwtpm", 0, 0, 147},
+	{"hmackey", 1, 0, 148},
+#if CONFIG_IMA_EVM_PROVIDER
+	{"provider", 1, 0, 149},
+#endif
+	{"v2", 0, 0, 150},
+	{"v3", 0, 0, 151},
+	{"log-level", 1, 0, 152},
 	{}
 
 };
@@ -3059,6 +3305,25 @@ static char *get_password(void)
 	return password;
 }
 
+
+#if CONFIG_IMA_EVM_PROVIDER
+static OSSL_PROVIDER *setup_provider(const char *name)
+{
+	OSSL_PROVIDER *p = OSSL_PROVIDER_try_load(NULL, name, 1);
+
+	if (!p) {
+		log_err("provider %s isn't available\n", optarg);
+		ERR_print_errors_fp(stderr);
+	} else if (!OSSL_PROVIDER_self_test(p)) {
+		log_err("provider %s self test failed\n", optarg);
+		ERR_print_errors_fp(stderr);
+		OSSL_PROVIDER_unload(p);
+		p = NULL;
+	}
+	return p;
+}
+#endif
+
 #if CONFIG_IMA_EVM_ENGINE
 static ENGINE *setup_engine(const char *engine_id)
 {
@@ -3079,10 +3344,42 @@ static ENGINE *setup_engine(const char *engine_id)
 }
 #endif
 
+static int parse_log_level(const char *arg)
+{
+	static const struct {
+		const char *name;
+		int level;
+	} levels[] = {
+		{ "err",     LOG_ERR },
+		{ "warning", LOG_WARNING },
+		{ "notice",  LOG_NOTICE },
+		{ "info",    LOG_INFO },
+		{ "debug",   LOG_DEBUG },
+	};
+	char *end;
+	long val;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(levels); i++) {
+		if (!ascii_strcasecmp(arg, levels[i].name))
+			return levels[i].level;
+	}
+
+	errno = 0;
+	val = strtol(arg, &end, 10);
+	if (errno || *end != '\0' || end == arg ||
+	    val < LOG_EMERG || val > LOG_DEBUG)
+		return -1;
+
+	return (int)val;
+}
+
 int main(int argc, char *argv[])
 {
+	bool version_chosen = false;
 	int err = 0, c, lind;
 	unsigned long keyid;
+	int level;
 	char *eptr;
 
 	errno = 0;	/* initialize global errno */
@@ -3098,7 +3395,7 @@ int main(int argc, char *argv[])
 	g_argc = argc;
 
 	while (1) {
-		c = getopt_long(argc, argv, "hvnsda:op::fu::k:t:ri", opts, &lind);
+		c = getopt_long(argc, argv, "hvnsda:op::fu::k:t:r", opts, &lind);
 		if (c == -1)
 			break;
 
@@ -3109,6 +3406,14 @@ int main(int argc, char *argv[])
 			break;
 		case 'v':
 			imaevm_params.verbose++;
+			break;
+		case 152:
+			level = parse_log_level(optarg);
+			if (level < 0) {
+				log_err("Invalid --log-level: %s\n", optarg);
+				exit(1);
+			}
+			imaevm_params.verbose = level;
 			break;
 		case 'd':
 			digest = 1;
@@ -3122,13 +3427,13 @@ int main(int argc, char *argv[])
 			sigdump = 1;
 			break;
 		case 'a':
-			imaevm_params.hash_algo = optarg;
+			g_hash_algo = optarg;
 			break;
 		case 'p':
 			if (optarg)
-				imaevm_params.keypass = optarg;
+				g_keypass = optarg;
 			else
-				imaevm_params.keypass = get_password();
+				g_keypass = get_password();
 			break;
 		case 'f':
 			sigfile = 1;
@@ -3139,22 +3444,13 @@ int main(int argc, char *argv[])
 				hmac_flags |= HMAC_FLAG_NO_UUID;
 			break;
 		case '1':
-			imaevm_params.x509 = 0;
+			sigflags |= IMAEVM_SIGFLAG_SIGNATURE_V1;
 			break;
 		case 'k':
 			imaevm_params.keyfile = optarg;
 			break;
-		case 'i':
-			if (evm_portable)
-				log_err("Portable and immutable options are exclusive, ignoring immutable option.");
-			else
-				evm_immutable = true;
-			break;
 		case 'o':
-			if (evm_immutable)
-				log_err("Portable and immutable options are exclusive, ignoring portable option.");
-			else
-				evm_portable = true;
+			evm_portable = true;
 			break;
 		case 't':
 			search_type = optarg;
@@ -3205,11 +3501,12 @@ int main(int argc, char *argv[])
 			break;
 #if CONFIG_IMA_EVM_ENGINE
 		case 139: /* --engine e */
-			imaevm_params.eng = setup_engine(optarg);
-			if (!imaevm_params.eng) {
+			access_info.u.engine = setup_engine(optarg);
+			if (!access_info.u.engine) {
 				log_info("setup_engine failed\n");
 				goto error;
 			}
+			access_info.type = IMAEVM_OSSL_ACCESS_TYPE_ENGINE;
 			break;
 #endif
 		case 140: /* --xattr-user */
@@ -3237,13 +3534,13 @@ int main(int argc, char *argv[])
 			 * UINT_MAX is `imaevm_params.keyid' maximum value,
 			 * 0 is reserved for keyid being unset.
 			 */
-			if (errno || eptr - optarg != strlen(optarg) ||
+			if (errno || (size_t)(eptr - optarg) != strlen(optarg) ||
 			    keyid == ULONG_MAX || keyid > UINT_MAX ||
 			    keyid == 0) {
 				log_err("Invalid keyid value.\n");
 				exit(1);
 			}
-			imaevm_params.keyid = keyid;
+			imaevm_keyid = keyid;
 			break;
 		case 145:
 			keyid = imaevm_read_keyid(optarg);
@@ -3251,13 +3548,42 @@ int main(int argc, char *argv[])
 				log_err("Error reading keyid.\n");
 				exit(1);
 			}
-			imaevm_params.keyid = keyid;
+			imaevm_keyid = keyid;
 			break;
 		case 146:
 			veritysig = 1;
 			break;
 		case 147:
 			hwtpm = 1;
+			break;
+		case 148:
+			imaevm_params.hmackeyfile = optarg;
+			break;
+#if CONFIG_IMA_EVM_PROVIDER
+		case 149: /* --provider p */
+			access_info.u.provider = setup_provider(optarg);
+			if (!access_info.u.provider) {
+				log_info("setup_provider failed\n");
+				goto error;
+			}
+			access_info.type = IMAEVM_OSSL_ACCESS_TYPE_PROVIDER;
+			break;
+#endif
+		case 150: /* --v2 */
+			if (version_chosen &&
+			    g_signature_version != SIGNATURE_V2) {
+				log_info("Switching to use v2 signatures.\n");
+			}
+			version_chosen = true;
+			g_signature_version = SIGNATURE_V2;
+			break;
+		case 151: /* --v3 */
+			if (version_chosen &&
+			    g_signature_version != SIGNATURE_V3) {
+				log_info("Switching to use v3 signatures.\n");
+			}
+			version_chosen = true;
+			g_signature_version = SIGNATURE_V3;
 			break;
 		case '?':
 			exit(1);
@@ -3267,16 +3593,27 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (!imaevm_params.keypass)
-		imaevm_params.keypass = getenv("EVMCTL_KEY_PASSWORD");
+	if (!g_keypass)
+		g_keypass = getenv("EVMCTL_KEY_PASSWORD");
 
 	if (imaevm_params.keyfile != NULL &&
-	    imaevm_params.eng == NULL &&
+	    access_info.type == IMAEVM_OSSL_ACCESS_TYPE_NONE &&
 	    !strncmp(imaevm_params.keyfile, "pkcs11:", 7)) {
-#if CONFIG_IMA_EVM_ENGINE
-		imaevm_params.eng = setup_engine("pkcs11");
+#if CONFIG_IMA_EVM_PROVIDER
+		if (access_info.type == IMAEVM_OSSL_ACCESS_TYPE_NONE) {
+			access_info.u.provider = setup_provider("pkcs11");
+			if (access_info.u.provider)
+				access_info.type = IMAEVM_OSSL_ACCESS_TYPE_PROVIDER;
+		}
 #endif
-		if (!imaevm_params.eng)
+#if CONFIG_IMA_EVM_ENGINE
+		if (access_info.type == IMAEVM_OSSL_ACCESS_TYPE_NONE) {
+			access_info.u.engine = setup_engine("pkcs11");
+			if (access_info.u.engine)
+				access_info.type = IMAEVM_OSSL_ACCESS_TYPE_ENGINE;
+		}
+#endif
+		if (access_info.type == IMAEVM_OSSL_ACCESS_TYPE_NONE)
 			goto error;
 	}
 
@@ -3302,16 +3639,23 @@ int main(int argc, char *argv[])
 
 error:
 #if CONFIG_IMA_EVM_ENGINE
-	if (imaevm_params.eng) {
-		ENGINE_finish(imaevm_params.eng);
-		ENGINE_free(imaevm_params.eng);
+	if (access_info.type == IMAEVM_OSSL_ACCESS_TYPE_ENGINE) {
+		ENGINE_finish(access_info.u.engine);
+		ENGINE_free(access_info.u.engine);
 #if OPENSSL_API_COMPAT < 0x10100000L
 		ENGINE_cleanup();
 #endif
 	}
 #endif
+#if CONFIG_IMA_EVM_PROVIDER
+	if (access_info.type == IMAEVM_OSSL_ACCESS_TYPE_PROVIDER)
+		OSSL_PROVIDER_unload(access_info.u.provider);
+#endif
 	ERR_free_strings();
 	EVP_cleanup();
 	BIO_free(NULL);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000
+	OPENSSL_cleanup();
+#endif
 	return err;
 }
